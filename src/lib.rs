@@ -1,20 +1,11 @@
 use arsdk_rs::{
     command::Feature,
-    frame::{BufferID, Type, Frame as InnerFrame},
+    frame::{BufferID, Frame as InnerFrame, Type},
 };
-use std::fmt::Debug;
 
-pub type RawFrame = Vec<Box<dyn FramePart>>;
-
-pub trait FramePart: Debug {}
-impl FramePart for InnerFrame {}
-impl FramePart for Type {}
-impl FramePart for BufferID {}
-impl FramePart for Feature {}
 
 pub struct Frame<S: FrameState> {
-    state: Box<RawFrame>,
-    extra: S,
+    state: S,
 }
 
 struct SetFrameType {}
@@ -28,96 +19,170 @@ struct SetFeature {
     buffer_id: BufferID,
 }
 
+struct ReceiveFeature {
+    frame_type: Type,
+    receive_buffer_id: ReceiveBufferId,
+}
+
+struct SendFeature {
+    frame_type: Type,
+    send_buffer_id: SendBufferId,
+}
+
 pub trait FrameState {}
 
 impl FrameState for SetFrameType {}
 impl FrameState for SetBufferId {}
 impl FrameState for SetFeature {}
+impl FrameState for SendFeature {}
+impl FrameState for ReceiveFeature {}
 impl FrameState for InnerFrame {}
 
 impl Frame<SetFrameType> {
     pub fn new() -> Self {
         Self {
-            state: Box::new(RawFrame::new()),
-            extra: SetFrameType {}
+            state: SetFrameType {},
         }
     }
 
-    pub fn frame_type(mut self, frame_type: Type) -> Frame<SetBufferId> {
-        self.state.push(Box::new(frame_type));
+    pub fn frame_type(self, frame_type: Type) -> Frame<SetBufferId> {
 
         Frame {
-            state: self.state,
-            extra: SetBufferId { frame_type },
+            state: SetBufferId { frame_type },
         }
     }
 }
 
+
 impl Frame<SetBufferId> {
-    pub fn buffer_id(mut self, buffer_id: BufferID) -> Frame<SetFeature> {
-        self.state.push(Box::new(buffer_id));
+    pub fn send(self, send: SendBufferId) -> Frame<SendFeature> {
 
         Frame {
-            state: self.state,
-            extra: SetFeature {
-                frame_type: self.extra.frame_type,
+            state: SendFeature {
+                frame_type: self.state.frame_type,
+                send_buffer_id: send,
+            },
+        }
+    }
+
+    pub fn receive(self, receive: ReceiveBufferId) -> Frame<ReceiveFeature> {
+        Frame {
+            state: ReceiveFeature {
+                frame_type: self.state.frame_type,
+                receive_buffer_id: receive,
+            },
+        }
+    }
+
+    pub fn buffer_id(self, buffer_id: BufferID) -> Frame<SetFeature> {
+        Frame {
+            state: SetFeature {
+                frame_type: self.state.frame_type,
                 buffer_id,
             },
         }
     }
 }
 
-impl Frame<SetFeature> {
-    pub fn feature(mut self, sequence: u8, feature: Feature) -> Frame<InnerFrame> {
-        self.state.push(Box::new(feature.clone()));
 
-        let inner = InnerFrame {
-            frame_type: self.extra.frame_type,
-            buffer_id: self.extra.buffer_id,
-            sequence_id: sequence,
-            feature: Some(feature),
-        };
 
-        Frame {
-            state: self.state,
-            extra: inner,
+
+pub enum SendBufferId {
+    Pong = 1,
+    NoAcknowledge = 10,
+    Acknowledge = 11,
+    Emergency = 12,
+    VideoAcknowledge = 13,
+}
+
+pub enum ReceiveBufferId {
+    Ping = 0,
+    Video = 125,
+    Event = 126,
+    Navigation = 127,
+    Acknowledge = 139,
+}
+
+impl Into<BufferID> for SendBufferId {
+    fn into(self) -> BufferID {
+        match self {
+            SendBufferId::Pong => BufferID::PONG,
+            SendBufferId::NoAcknowledge => BufferID::CDNonAck,
+            SendBufferId::Acknowledge => BufferID::CDAck,
+            SendBufferId::Emergency => BufferID::CDEmergency,
+            SendBufferId::VideoAcknowledge => BufferID::CDVideoAck,
         }
     }
 }
 
-impl Frame<InnerFrame> {
-    pub fn raw_frame(&self) -> &RawFrame {
-        &self.state
-    }
-
-    pub fn as_frame(self) -> InnerFrame {
-        self.extra
+impl Into<BufferID> for ReceiveBufferId {
+    fn into(self) -> BufferID {
+        match self {
+            ReceiveBufferId::Ping => BufferID::PING,
+            ReceiveBufferId::Video => BufferID::DCVideo,
+            ReceiveBufferId::Event => BufferID::DCEvent,
+            ReceiveBufferId::Navigation => BufferID::DCNavdata,
+            ReceiveBufferId::Acknowledge => BufferID::ACKFromSendWithAck,
+        }
     }
 }
 
+impl Frame<SetFeature> {
+    pub fn feature(self, sequence: u8, feature: Feature) -> InnerFrame {
+        InnerFrame {
+            frame_type: self.state.frame_type,
+            buffer_id: self.state.buffer_id,
+            sequence_id: sequence,
+            feature: Some(feature),
+        }
+    }
+}
+
+impl Frame<SendFeature> {
+    pub fn feature(self, sequence: u8, feature: Feature) -> InnerFrame {
+        InnerFrame {
+            frame_type: self.state.frame_type,
+            buffer_id: self.state.send_buffer_id.into(),
+            sequence_id: sequence,
+            feature: Some(feature),
+        }
+    }
+}
+
+impl Frame<ReceiveFeature> {
+    pub fn feature(self, sequence: u8, feature: Feature) -> InnerFrame {
+        InnerFrame {
+            frame_type: self.state.frame_type,
+            buffer_id: self.state.receive_buffer_id.into(),
+            sequence_id: sequence,
+            feature: Some(feature),
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use arsdk_rs::ardrone3::{ArDrone3, Piloting};
-    use scroll::{Pread, LE, Pwrite};
+    use arsdk_rs::jumping_sumo::{Class, Anim};
+    use scroll::{Pread, Pwrite, LE};
 
     #[test]
     fn build_a_frame() {
-        let feature = Feature::ArDrone3(Some(ArDrone3::Piloting(Piloting::TakeOff)));
+        let feature = Feature::JumpingSumo(Class::Animations(Anim::Jump));
 
         let frame = Frame::new()
-        .frame_type(Type::DataWithAck).buffer_id(BufferID::CDAck).feature(1, feature);
+            .frame_type(Type::DataWithAck)
+            .send(SendBufferId::Acknowledge)
+            .feature(1, feature);
 
         let message: [u8; 15] = [
             0x4, 0xb, 0x1, 0xf, 0x0, 0x0, 0x0, 0x3, 0x2, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0,
         ];
 
-
-        dbg!(frame.raw_frame());
-        assert_frames_match(&message, frame.as_frame());
+        assert_frames_match(&message, frame);
     }
 
+    // Copy-pasted from `arsdk-rs`
     fn assert_frames_match(expected: &[u8], frame: InnerFrame) {
         // Check the value at the Frame length bytes 3 to 7
         let buf_len: u32 = (&expected[3..7])
